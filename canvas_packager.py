@@ -14,16 +14,21 @@ import argparse
 import textwrap
 import hashlib
 import json
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, utils
 
 # Compute the SHA256 hash of the given file
 def sha256sum(filename):
-    h  = hashlib.sha256()
-    b  = bytearray(128*1024)
-    mv = memoryview(b)
-    with open(filename, 'rb', buffering=0) as f:
-        while n := f.readinto(mv):
-            h.update(mv[:n])
-    return h.hexdigest()
+    hasher = hashes.Hash(hashes.SHA256())
+    with open(filename, 'rb') as f:
+        while chunk := f.read(4096):
+            hasher.update(chunk)
+    return hasher.finalize()
+
+# Sign a file using our private key
+def sign(filename, key):
+    hash = sha256sum(filename)
+    return key.sign(hash, ec.ECDSA(utils.Prehashed(hashes.SHA256())))
 
 # Parse the command line arguments
 parser = argparse.ArgumentParser(
@@ -39,6 +44,7 @@ parser = argparse.ArgumentParser(
                 '''))
 parser.add_argument("directory", help="directory to package, also used as package name")
 parser.add_argument("--version", "-v", help="Version number to use", required=True)
+parser.add_argument("--sign", "-s", help="Sign the source files with the provided private key")
 args = parser.parse_args()
 
 # Gather the file list
@@ -49,14 +55,25 @@ files = [f for f in os.listdir(args.directory) if os.path.isfile(os.path.join(ar
 if "manifest.json" in files:
     files.remove("manifest.json")
 
+# Open the key file if we were asked to sign
+if args.sign is not None:
+    with open(args.sign, "rb") as key_file:
+        key = serialization.load_pem_private_key(key_file.read(), password=None)
+
 # Build the manifest
 manifest = {}
 manifest["name"] = args.directory
 manifest["version"] = args.version
-manifest["verify"] = "sha256"
-manifest["files"] = {}
-for f in files:
-    manifest["files"][f] = sha256sum(os.path.join(args.directory, f))
+if args.sign is not None:
+    manifest["verify"] = "ecdsa-sha256"
+    manifest["files"] = {}
+    for f in sorted(files):
+        manifest["files"][f] = sign(os.path.join(args.directory, f), key).hex()
+else:
+    manifest["verify"] = "sha256"
+    manifest["files"] = {}
+    for f in sorted(files):
+        manifest["files"][f] = sha256sum(os.path.join(args.directory, f)).hex()
 
 # Write the manifest file
 with open(os.path.join(args.directory, "manifest.json"), "w") as f:
@@ -64,7 +81,6 @@ with open(os.path.join(args.directory, "manifest.json"), "w") as f:
 
 # Create the ZIP file
 with zipfile.ZipFile(args.directory + "_" + args.version + ".zip", "w", compression=zipfile.ZIP_STORED) as zip:
-    for f in files:
+    for f in sorted(files):
         zip.write(os.path.join(args.directory, f), arcname=f)
     zip.write(os.path.join(args.directory, "manifest.json"), arcname="manifest.json")
-
